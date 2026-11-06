@@ -50,6 +50,10 @@ ADDR_WHERE = _lan_filter("na.ip")
 WINDOWS = {"1h": 3600, "24h": 86400, "7d": 604800, "all": 0}
 DEFAULT_WINDOW = "24h"
 
+CHART_MAX_POINTS = 150
+CHART_BUCKETS = (60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600,
+                 43200, 86400)
+
 QUERY_TYPE_NAMES = {
     1: "A", 2: "AAAA", 3: "ANY", 4: "SRV", 5: "SOA", 6: "PTR", 7: "TXT",
     8: "NAPTR", 9: "MX", 10: "DS", 11: "RRSIG", 12: "DNSKEY", 13: "NS",
@@ -294,21 +298,66 @@ def category_counts(conn, where, params, client_ip=None) -> list:
     return sorted(buckets.values(), key=lambda b: b["count"], reverse=True)
 
 
-def timeline(conn, where, params, window_seconds, client_ip=None) -> list:
-    bucket = bucket_seconds(window_seconds or 604800)
-    sql = f"""SELECT (CAST(q.timestamp AS INTEGER)/{bucket})*{bucket} AS slot,
-                     COUNT(*) AS total,
+def chart_bucket_seconds(span_seconds: int) -> int:
+    """Smallest standard bucket that keeps `span_seconds` within
+    CHART_MAX_POINTS points, so the line has detail without turning to noise."""
+    for bucket in CHART_BUCKETS:
+        if span_seconds <= bucket * CHART_MAX_POINTS:
+            return bucket
+    return CHART_BUCKETS[-1]
+
+
+def align_down(epoch: int, bucket: int, utc_offset: int) -> int:
+    """Start of the local-time bucket containing `epoch`, so day buckets begin
+    at local midnight rather than UTC midnight."""
+    return (epoch + utc_offset) // bucket * bucket - utc_offset
+
+
+def fill_timeline(counts: dict, bucket: int, first_slot: int,
+                  last_slot: int) -> list:
+    """One point per bucket from first_slot to last_slot inclusive. Buckets with
+    no queries are explicit zeros so the chart's time axis stays linear."""
+    points = []
+    for slot in range(first_slot, last_slot + 1, bucket):
+        total, blocked = counts.get(slot, (0, 0))
+        points.append({"ts": slot, "allowed": total - blocked,
+                       "blocked": blocked})
+    return points
+
+
+def timeline(conn, where, params, window_seconds, client_ip=None) -> dict:
+    """Zero-filled allowed/blocked counts per bucket up to now.
+
+    The series starts at the window start or the first query FTL ever logged,
+    whichever is later: before that there is no data, not zero traffic.
+    `start` is reported so the client can mark the first bucket as partial.
+    """
+    now = int(time.time())
+    first = conn.execute("SELECT MIN(timestamp) AS t FROM queries").fetchone()
+    if first["t"] is None:
+        return {"bucket": CHART_BUCKETS[0], "start": now, "points": []}
+    start = int(first["t"])
+    if window_seconds:
+        start = max(start, now - window_seconds)
+    bucket = chart_bucket_seconds(now - start)
+    offset = time.localtime(now).tm_gmtoff
+    counts = _timeline_counts(conn, where, params, bucket, offset, client_ip)
+    return {"bucket": bucket, "start": start, "points": fill_timeline(
+        counts, bucket, align_down(start, bucket, offset),
+        align_down(now, bucket, offset))}
+
+
+def _timeline_counts(conn, where, params, bucket, offset, client_ip) -> dict:
+    slot = (f"((CAST(q.timestamp AS INTEGER) + {offset}) / {bucket}) "
+            f"* {bucket} - {offset}")
+    sql = f"""SELECT {slot} AS slot, COUNT(*) AS total,
                      SUM(q.status IN ({_blocked_sql})) AS blocked
               FROM queries q WHERE {CLIENT_WHERE} {where}
               {"AND q.client = ?" if client_ip else ""}
-              GROUP BY slot ORDER BY slot"""
+              GROUP BY slot"""
     args = list(params) + ([client_ip] if client_ip else [])
-    out = []
-    for r in conn.execute(sql, args):
-        blk = int(r["blocked"] or 0)
-        out.append({"t": local_time(r["slot"]), "blocked": blk,
-                    "allowed": r["total"] - blk})
-    return out
+    return {r["slot"]: (r["total"], int(r["blocked"] or 0))
+            for r in conn.execute(sql, args)}
 
 
 def top_domains(conn, where, params, blocked_only, client_ip=None) -> list:
@@ -531,7 +580,32 @@ main{padding:18px 22px}
 .feed td.d{font-family:ui-monospace,monospace;max-width:260px;overflow:hidden;text-overflow:ellipsis}
 .feed .st{font-size:10px;padding:1px 6px;border-radius:6px;background:#17351f;color:var(--ok)}
 .feed .st.b{background:#3a1416;color:var(--bad)}
-svg{display:block;width:100%;height:110px}
+.legend{display:flex;gap:18px;align-items:center;flex-wrap:wrap;font-size:12px;color:var(--mut);margin:-2px 0 10px}
+.legend i{display:inline-block;width:14px;height:2px;border-radius:1px;vertical-align:middle;margin-right:7px}
+.legend b{color:var(--txt);font-weight:600;margin-left:5px}
+.legend .unit{margin-left:auto;font-size:11px}
+.tchart{position:relative;border-radius:8px;outline:none}
+.tchart:focus-visible{box-shadow:0 0 0 2px var(--accent)}
+.tchart svg{display:block;touch-action:pan-y}
+.tchart .gl{stroke:var(--line)}
+.tchart .bl{stroke:#2e3a50}
+.tchart .al{fill:var(--mut);font-size:11px;font-variant-numeric:tabular-nums}
+.tchart .ln{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.tchart .xh{stroke:#55627a}
+.tchart .dot{stroke:var(--panel);stroke-width:2}
+.tchart .partial{opacity:.4}
+.tip{position:absolute;top:6px;pointer-events:none;background:#0b0f17f2;border:1px solid var(--line);
+border-radius:8px;padding:8px 11px;font-size:12px;box-shadow:0 8px 24px #0009;white-space:nowrap}
+.tip .th{color:var(--mut);font-size:11px;margin-bottom:6px}
+.tip .tr{display:flex;align-items:center;gap:8px;padding:1px 0}
+.tip .tr i{width:12px;height:2px;border-radius:1px}
+.tip .tr b{font-variant-numeric:tabular-nums;min-width:48px}
+.tip .tr span,.tip .tf{color:var(--mut)}
+.tip .tf{font-size:11px;margin-top:6px}
+.tview summary{cursor:pointer;color:var(--mut);font-size:11px;margin-top:8px;width:max-content}
+.tview .feed{max-height:240px;margin-top:6px}
+.tview th{text-align:left;color:var(--mut);font-weight:500;padding:4px 6px;border-bottom:1px solid var(--line)}
+.tview .n{text-align:right;font-variant-numeric:tabular-nums}
 .muted{color:var(--mut);font-size:12px}
 .sectitle{font-size:12px;color:var(--mut);text-transform:uppercase;letter-spacing:.6px;margin:16px 0 8px}
 .note{font-size:11px;color:var(--mut);margin-top:6px}
@@ -590,22 +664,181 @@ function catPanel(title,cats){
   }).join("")||'<div class="muted">No data.</div>';
   return `<div class="panel"><h3>${title}</h3>${rows}</div>`;
 }
-function areaChart(tl){
-  if(!tl.length) return '<div class="muted">No activity in this window.</div>';
-  const W=600,H=110,n=tl.length,max=Math.max(1,...tl.map(d=>d.allowed+d.blocked));
-  const bw=W/n;
-  const bars=tl.map((d,i)=>{
-    const x=i*bw, ta=d.allowed/max*H, tb=d.blocked/max*H;
-    return `<rect x="${x+0.5}" y="${H-ta-tb}" width="${bw-1}" height="${tb}" fill="var(--bad)"/>`+
-      `<rect x="${x+0.5}" y="${H-ta}" width="${bw-1}" height="${ta}" fill="var(--accent)"/>`;
-  }).join("");
-  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${bars}</svg>`+
-    `<div class="row" style="grid-template-columns:1fr 1fr;margin-top:6px"><span class="muted">${esc(tl[0].t||"")}</span>`+
-    `<span class="muted" style="text-align:right">${esc(tl[tl.length-1].t||"")}</span></div>`;
+/* Queries-over-time line chart: drawn at the container's real pixel width so
+   text and 2px strokes stay crisp, with a crosshair tooltip and a table twin. */
+const CHART={height:230,top:12,right:14,bottom:28,minWidth:320,yIntervals:4,
+  xTickGap:96,charW:6.4,labelGap:8,tipGap:14,hitPad:8,washTop:.2,dotR:4.5};
+const SERIES=[{key:"allowed",name:"Allowed",color:"var(--accent)"},
+              {key:"blocked",name:"Blocked",color:"var(--bad)"}];
+const MINUTE_S=60,HOUR_S=3600,DAY_S=86400;
+const TICK_STEPS=[60,120,300,600,900,1800,3600,7200,10800,21600,43200,86400,172800,604800];
+const chartData={};
+let chartSeq=0,tableOpen=false;
+
+const pad2=v=>String(v).padStart(2,"0");
+const hhmm=d=>pad2(d.getHours())+":"+pad2(d.getMinutes());
+const dayLabel=(d,o)=>d.toLocaleDateString(undefined,o||{month:"short",day:"numeric"});
+const compactNum=v=>v>=1e6?+(v/1e6).toFixed(1)+"M":v>=1e3?+(v/1e3).toFixed(1)+"K":String(v);
+function mk(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e;}
+
+function bucketLabel(b){
+  const [unit,size]=b>=DAY_S?["day",DAY_S]:b>=HOUR_S?["hour",HOUR_S]:["minute",MINUTE_S];
+  const k=b/size;return k===1?unit:`${k} ${unit}s`;
+}
+function slotLabel(ts,bucket){
+  const d=new Date(ts*1000),day=dayLabel(d,{weekday:"short",month:"short",day:"numeric"});
+  return bucket>=DAY_S?day:`${day} · ${hhmm(d)}–${hhmm(new Date((ts+bucket)*1000))}`;
+}
+function niceStep(raw){
+  if(raw<=1)return 1;
+  const p=10**Math.floor(Math.log10(raw)),f=raw/p;
+  return p*[1,2,2.5,5,10].find(c=>f<=c&&Number.isInteger(c*p));
+}
+/* Ticks are built from local calendar days so they stay on wall-clock
+   boundaries (midnight, 06:00, ...) across daylight-saving changes. */
+function timeTicks(t0,t1,maxTicks){
+  const span=Math.max(1,t1-t0);
+  const step=TICK_STEPS.find(s=>span/s<=maxTicks)||TICK_STEPS[TICK_STEPS.length-1];
+  const perDay=step>=DAY_S?1:DAY_S/step,dayStride=Math.max(1,step/DAY_S);
+  const ticks=new Set(),day=new Date(t0*1000);day.setHours(0,0,0,0);
+  for(;day.getTime()/1000<=t1;day.setDate(day.getDate()+dayStride)){
+    for(let k=0;k<perDay;k++){
+      const t=new Date(day.getFullYear(),day.getMonth(),day.getDate(),0,k*step/MINUTE_S).getTime()/1000;
+      if(t>=t0&&t<=t1)ticks.add(t);
+    }
+  }
+  return {step,ticks:[...ticks]};
+}
+function tickLabel(t,step){
+  const d=new Date(t*1000),midnight=d.getHours()===0&&d.getMinutes()===0;
+  return step>=DAY_S||midnight?dayLabel(d):hhmm(d);
 }
 
+function timeChart(tl){
+  if(!tl||!tl.points||!tl.points.length)return '<div class="muted">No activity in this window.</div>';
+  const id="tc"+(++chartSeq);chartData[id]=tl;
+  const sum=k=>tl.points.reduce((a,p)=>a+p[k],0);
+  const legend=SERIES.map(s=>`<span><i style="background:${s.color}"></i>${s.name}<b>${fmt(sum(s.key))}</b></span>`).join("");
+  return `<div class="legend">${legend}<span class="unit">queries per ${bucketLabel(tl.bucket)}</span></div>`+
+    `<div class="tchart" id="${id}" tabindex="0" role="figure" aria-label="Allowed and blocked queries over time. Arrow keys step through the values."></div>`+
+    tableView(tl);
+}
+function tableView(tl){
+  const rows=tl.points.slice().reverse().map(p=>`<tr><td>${esc(slotLabel(p.ts,tl.bucket))}</td>`+
+    `<td class="n">${fmt(p.allowed)}</td><td class="n">${fmt(p.blocked)}</td><td class="n">${fmt(p.allowed+p.blocked)}</td></tr>`).join("");
+  return `<details class="tview"${tableOpen?" open":""}><summary>Show as table</summary><div class="feed"><table>`+
+    `<tr><th>Time</th><th class="n">Allowed</th><th class="n">Blocked</th><th class="n">Total</th></tr>${rows}</table></div></details>`;
+}
+
+function chartGeometry(width,tl){
+  const pts=tl.points,n=pts.length;
+  const peak=Math.max(1,...pts.map(p=>Math.max(p.allowed,p.blocked)));
+  const step=niceStep(peak/CHART.yIntervals),yMax=Math.ceil(peak/step)*step;
+  const yTicks=Array.from({length:Math.round(yMax/step)+1},(_,i)=>i*step);
+  const yLabels=yTicks.map(v=>yMax>=1e4?compactNum(v):fmt(v));
+  const left=Math.ceil(Math.max(...yLabels.map(s=>s.length))*CHART.charW)+CHART.labelGap*2;
+  const W=Math.max(CHART.minWidth,Math.floor(width)),pw=W-left-CHART.right;
+  const base=CHART.height-CHART.bottom,ph=base-CHART.top,t0=pts[0].ts,t1=pts[n-1].ts;
+  return {pts,n,W,left,pw,base,yTicks,yLabels,t0,t1,bucket:tl.bucket,start:tl.start,
+    x:i=>left+(n>1?i*pw/(n-1):pw/2),
+    xt:t=>left+(t1>t0?(t-t0)/(t1-t0)*pw:pw/2),
+    y:v=>base-v/yMax*ph};
+}
+function axesSvg(g){
+  const crisp=v=>Math.round(v)+.5;
+  const rows=g.yTicks.map((v,i)=>`<line x1="${g.left}" x2="${g.W-CHART.right}" y1="${crisp(g.y(v))}" y2="${crisp(g.y(v))}" class="${v?"gl":"bl"}"/>`+
+    `<text x="${g.left-CHART.labelGap}" y="${g.y(v)+4}" text-anchor="end" class="al">${g.yLabels[i]}</text>`).join("");
+  const {step,ticks}=timeTicks(g.t0,g.t1,Math.max(2,Math.floor(g.pw/CHART.xTickGap)));
+  const cols=ticks.map(t=>{
+    const label=tickLabel(t,step),half=label.length*CHART.charW/2;
+    const cx=Math.min(Math.max(g.xt(t),half),g.W-half);
+    return `<line x1="${crisp(g.xt(t))}" x2="${crisp(g.xt(t))}" y1="${g.base}" y2="${g.base+4}" class="bl"/>`+
+      `<text x="${cx}" y="${g.base+18}" text-anchor="middle" class="al">${label}</text>`;
+  }).join("");
+  return rows+cols;
+}
+/* Partial buckets (cut by the window start, or still filling now) are drawn
+   faded so their low counts don't read as sudden drops in traffic. */
+const isHeadPartial=(p,g)=>p.ts<g.start;
+const isTailPartial=(p,g)=>p.ts+g.bucket>Date.now()/1000;
+function linePath(g,key,from,to){
+  return g.pts.slice(from,to).map((p,i)=>`${i?"L":"M"}${g.x(from+i).toFixed(1)},${g.y(p[key]).toFixed(1)}`).join("");
+}
+function seriesLines(g,s,head,live){
+  const seg=(from,to,cls)=>`<path d="${linePath(g,s.key,from,to)}" class="ln${cls}" style="stroke:${s.color}"/>`;
+  return seg(head?1:0,live?g.n-1:g.n,"")+(head?seg(0,2," partial"):"")+(live?seg(g.n-2,g.n," partial"):"");
+}
+function seriesSvg(g,id){
+  const head=g.n>2&&isHeadPartial(g.pts[0],g),live=g.n>1&&isTailPartial(g.pts[g.n-1],g);
+  const floor=`L${g.x(g.n-1).toFixed(1)},${g.base}L${g.x(0).toFixed(1)},${g.base}Z`;
+  const defs=SERIES.map(s=>`<linearGradient id="${id}-${s.key}" x1="0" y1="0" x2="0" y2="1">`+
+    `<stop offset="0" style="stop-color:${s.color};stop-opacity:${CHART.washTop}"/>`+
+    `<stop offset="1" style="stop-color:${s.color};stop-opacity:0"/></linearGradient>`).join("");
+  const areas=SERIES.map(s=>`<path d="${linePath(g,s.key,0,g.n)}${floor}" fill="url(#${id}-${s.key})"/>`).join("");
+  const lines=SERIES.map(s=>seriesLines(g,s,head,live)).join("");
+  const last=g.pts[g.n-1];
+  const ends=SERIES.map(s=>`<circle class="dot${live?" partial":""}" r="${CHART.dotR}" cx="${g.x(g.n-1)}" cy="${g.y(last[s.key])}" style="fill:${s.color}"/>`).join("");
+  return `<defs>${defs}</defs>${areas}${lines}${ends}`;
+}
+function hoverSvg(g){
+  const dots=SERIES.map(s=>`<circle class="dot hd" r="${CHART.dotR}" style="fill:${s.color}" visibility="hidden"/>`).join("");
+  return `<line class="xh" y1="${CHART.top}" y2="${g.base}" visibility="hidden"/>${dots}`+
+    `<rect x="${g.left-CHART.hitPad}" y="0" width="${g.pw+2*CHART.hitPad}" height="${CHART.height}" fill="transparent"/>`;
+}
+
+function drawChart(el,tl){
+  const g=chartGeometry(el.clientWidth,tl);
+  el.innerHTML=`<svg width="${g.W}" height="${CHART.height}" viewBox="0 0 ${g.W} ${CHART.height}" aria-hidden="true">`+
+    axesSvg(g)+seriesSvg(g,el.id)+hoverSvg(g)+`</svg><div class="tip" hidden></div>`;
+  attachHover(el,g);
+}
+function fillTip(tip,p,g){
+  const total=p.allowed+p.blocked,pct=total?(100*p.blocked/total).toFixed(1):"0.0";
+  tip.replaceChildren(mk("div","th",slotLabel(p.ts,g.bucket)));
+  SERIES.forEach(s=>{
+    const row=mk("div","tr"),key=mk("i");key.style.background=s.color;
+    row.append(key,mk("b","",fmt(p[s.key])),mk("span","",s.name));tip.append(row);
+  });
+  tip.append(mk("div","tf",`Total ${fmt(total)} · ${pct}% blocked`));
+  if(isHeadPartial(p,g))tip.append(mk("div","tf","Partial interval (window starts mid-way)"));
+  if(isTailPartial(p,g))tip.append(mk("div","tf","Interval still in progress"));
+  tip.hidden=false;
+}
+function attachHover(el,g){
+  const svg=el.querySelector("svg"),tip=el.querySelector(".tip");
+  const cross=svg.querySelector(".xh"),dots=[...svg.querySelectorAll(".hd")];
+  let cur=-1;
+  const show=i=>{
+    cur=Math.max(0,Math.min(g.n-1,i));const p=g.pts[cur],cx=g.x(cur);
+    cross.setAttribute("x1",cx);cross.setAttribute("x2",cx);cross.setAttribute("visibility","visible");
+    dots.forEach((d,k)=>{d.setAttribute("cx",cx);d.setAttribute("cy",g.y(p[SERIES[k].key]));d.setAttribute("visibility","visible");});
+    fillTip(tip,p,g);
+    const right=cx+CHART.tipGap+tip.offsetWidth<=g.W;
+    tip.style.left=(right?cx+CHART.tipGap:Math.max(0,cx-CHART.tipGap-tip.offsetWidth))+"px";
+  };
+  const hide=()=>{cur=-1;[cross,...dots].forEach(e=>e.setAttribute("visibility","hidden"));tip.hidden=true;};
+  const fromPointer=e=>{const r=svg.getBoundingClientRect();show(g.n>1?Math.round((e.clientX-r.left-g.left)/g.pw*(g.n-1)):0);};
+  svg.addEventListener("pointermove",fromPointer);svg.addEventListener("pointerdown",fromPointer);
+  svg.addEventListener("pointerleave",hide);
+  el.addEventListener("focus",()=>show(g.n-1));el.addEventListener("blur",hide);
+  el.addEventListener("keydown",e=>{
+    const move={ArrowLeft:-1,ArrowRight:1}[e.key];
+    if(move){e.preventDefault();show((cur<0?g.n-1:cur)+move);}
+  });
+}
+function mountCharts(){
+  for(const id of Object.keys(chartData)){
+    const el=document.getElementById(id);
+    if(el)drawChart(el,chartData[id]);else delete chartData[id];
+  }
+}
+let resizeFrame=0;
+window.addEventListener("resize",()=>{cancelAnimationFrame(resizeFrame);resizeFrame=requestAnimationFrame(mountCharts);});
+document.addEventListener("toggle",e=>{if(e.target.classList&&e.target.classList.contains("tview"))tableOpen=e.target.open;},true);
+
 async function renderOverview(){
-  const d=await api("/api/overview");
+  const asked=win,d=await api("/api/overview");
+  if(asked!==win||view!=="overview")return;
   if(d.error){document.getElementById("view").innerHTML='<div class="muted">Error: '+d.error+'</div>';return;}
   renderHealth(d.health);
   const tiles=[["queries",fmt(d.total),""],["blocked",fmt(d.blocked),"bad"],
@@ -618,7 +851,7 @@ async function renderOverview(){
   const up=d.upstreams.map(x=>barRow(x.name,x.count,(d.upstreams[0]||{count:1}).count,"ac",true)).join("")||'<div class="muted">cache only</div>';
   document.getElementById("view").innerHTML=
     `<div class="tiles">${tiles}</div>`+
-    `<div class="panel" style="margin-bottom:14px"><h3>Queries over time (blue allowed &middot; red blocked)</h3>${areaChart(d.timeline)}</div>`+
+    `<div class="panel" style="margin-bottom:14px"><h3>Queries over time</h3>${timeChart(d.timeline)}</div>`+
     `<div class="grid">`+
       catPanel("Traffic by category",d.categories)+
       listPanel("Top domains",d.top_domains,{k:"domain",v:"count",mono:true},"ac")+
@@ -627,6 +860,7 @@ async function renderOverview(){
       `<div class="panel"><h3>Reply types</h3>${rt}</div>`+
       `<div class="panel"><h3>Upstream resolvers</h3>${up}<div class="note">DNSSEC validation: off</div></div>`+
     `</div>`;
+  mountCharts();
 }
 function renderHealth(h){
   if(!h){document.getElementById("health").innerHTML="";return;}
@@ -655,7 +889,8 @@ async function renderDevices(){
   if(selIp)renderDetail(selIp);
 }
 async function renderDetail(ip){
-  const d=await api("/api/device?ip="+encodeURIComponent(ip));
+  const asked=win,d=await api("/api/device?ip="+encodeURIComponent(ip));
+  if(asked!==win||ip!==selIp)return;
   const host=document.getElementById("detail");if(!host)return;
   if(d.error){host.innerHTML='<div class="muted">Error: '+d.error+'</div>';return;}
   const id=d.identity||{};
@@ -674,7 +909,7 @@ async function renderDetail(ip){
       <span>first seen <b>${esc(id.first_seen||"?")}</b></span><span>last seen <b>${esc(d.last_seen||"?")}</b></span>
       <span>lifetime <b>${fmt(id.lifetime)}</b> queries</span></div>
       <div class="tiles">${tiles}</div>
-      <div class="sectitle">Activity over time</div>${areaChart(d.timeline)}</div>
+      <div class="sectitle">Activity over time</div>${timeChart(d.timeline)}</div>
     <div class="grid" style="margin-top:14px">`+
       catPanel("What it's doing (by category)",d.categories)+
       listPanel("Top domains",d.top_domains,{k:"domain",v:"count",mono:true},"ac")+
@@ -684,6 +919,7 @@ async function renderDetail(ip){
     `</div>`+
     `<div class="panel" style="margin-top:14px"><h3>Recent lookups (latest ${d.recent.length})</h3>`+
       `<div class="feed"><table>${feed||'<tr><td class="muted">none</td></tr>'}</table></div></div>`;
+  mountCharts();
 }
 
 function render(){ view==="overview"?renderOverview():renderDevices(); }
