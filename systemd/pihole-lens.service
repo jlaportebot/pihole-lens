@@ -1,0 +1,24 @@
+[Unit]
+Description=Pi-hole Lens - per-device DNS analytics dashboard
+After=network.target pihole-FTL.service
+Wants=pihole-FTL.service
+
+[Service]
+Type=simple
+User=pihole
+Group=pihole
+ExecStart=/usr/bin/python3 /opt/pihole-lens/server.py
+Restart=on-failure
+RestartSec=5
+# Uncomment to override defaults:
+#Environment=LENS_PORT=8053
+#Environment=LENS_SUBNET=10.0.0.
+
+# Hardening: read-only everywhere except what it needs (nothing to write).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
