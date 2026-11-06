@@ -27,7 +27,7 @@ Lens doesn't replace Pi-hole's admin page — it sits beside it and answers a di
 
 **Network Overview tab**
 - Headline tiles: total queries, blocked, block rate, active devices, unique domains, cache-hit rate, average lookup latency, blocklist size.
-- Queries-over-time chart (allowed vs. blocked), bucketed to the selected window.
+- Queries-over-time line chart (allowed vs. blocked) with real time and count axes, a hover crosshair and tooltip, arrow-key navigation, and a "show as table" view. Bucket size adapts to the window (1 minute for the last hour, 10 minutes for a day, 2 hours for a week), and empty buckets are plotted as zero so the time axis stays linear.
 - **Traffic by category** across the whole network.
 - Top domains, top blocked domains, query-type and reply-type breakdowns, and which upstream resolvers answered.
 - Live host health (CPU load, RAM, temperature, uptime) read from `/proc` and the thermal sensor.
@@ -114,6 +114,12 @@ Pi-hole's FTL engine logs every query to a SQLite database. Lens opens that data
 ## Contributing
 
 The domain classifier (`CLASSIFY_RULES` in `server.py`) is a best-effort heuristic — PRs that improve category coverage are very welcome. Keep it dependency-free.
+
+Run the tests (standard library only) with:
+
+```bash
+python3 -m unittest discover -s tests
+```
 
 ## License
 
